@@ -46,6 +46,14 @@ class OpenAiClient(
                 }
                 .bodyToMono(OpenAiResponse::class.java)
                 .map { it.choices.firstOrNull()?.message?.content ?: "" }
+                // 타임아웃 계층: connect 5s (WebClientConfig) / response 60s (WebClientConfig) / 전체 120s (여기)
+                // 일시 네트워크 IO 오류만 재시도. CustomException(4xx/5xx→onStatus 변환)은 재시도 제외.
+                .retryWhen(
+                    Retry.backoff(2, Duration.ofSeconds(1))
+                        .jitter(0.5)
+                        .maxBackoff(Duration.ofSeconds(8))
+                        .filter { it !is CustomException },
+                )
                 .timeout(Duration.ofSeconds(120))
                 .block() ?: throw CustomException(ErrorCode.AI_API_ERROR)
         } catch (e: CustomException) {
@@ -86,6 +94,7 @@ class OpenAiClient(
                     .maxBackoff(Duration.ofSeconds(8))
                     .filter { it !is CustomException }, // 4xx/파싱오류는 재시도 안 함, 일시 네트워크 오류만
             )
+            // 타임아웃 계층: connect 5s (WebClientConfig) / response 60s (WebClientConfig) / 전체 120s (여기)
             .timeout(Duration.ofSeconds(120))
             .onErrorMap({ it !is CustomException }) {
                 log.error("OpenAI stream failed", it)

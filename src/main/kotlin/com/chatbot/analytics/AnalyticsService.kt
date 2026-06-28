@@ -37,27 +37,29 @@ class AnalyticsService(
         val now = OffsetDateTime.now()
         val from = now.minusHours(24)
 
-        val chats = chatRepository.findByCreatedAtBetween(from, now)
-
         val headers = listOf(
             "chat_id", "thread_id", "user_id", "user_email", "user_name",
             "question", "answer", "model", "created_at"
         )
 
-        val rows = chats.map { chat ->
-            listOf(
-                chat.id.toString(),
-                chat.thread.id.toString(),
-                chat.user.id.toString(),
-                chat.user.email,
-                chat.user.name,
-                chat.question,
-                chat.answer,
-                chat.model,
-                chat.createdAt.toString()
+        chatRepository.streamWithUserByCreatedAtBetween(from, now).use { stream ->
+            CsvUtil.writeCsvStream(
+                headers,
+                stream.iterator().asSequence().map { chat ->
+                    listOf(
+                        chat.id.toString(),
+                        chat.thread.id.toString(),
+                        chat.user.id.toString(),
+                        chat.user.email,
+                        chat.user.name,
+                        chat.question,
+                        chat.answer,
+                        chat.model,
+                        chat.createdAt.toString()
+                    )
+                },
+                response
             )
         }
-
-        CsvUtil.writeCsvToResponse(rows, headers, response)
     }
 }

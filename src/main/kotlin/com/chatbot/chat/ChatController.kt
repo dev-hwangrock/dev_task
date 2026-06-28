@@ -41,7 +41,7 @@ class ChatController(
         @Valid @RequestBody request: ChatCreateRequest,
     ): Any {
         return if (request.isStreaming) {
-            val emitter = SseEmitter(0L)
+            val emitter = SseEmitter(130_000L)
             chatService.createChatStreaming(userDetails.id, request, emitter)
             emitter
         } else {

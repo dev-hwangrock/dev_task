@@ -1,46 +1,41 @@
 package com.chatbot.chat
 
-import com.chatbot.ai.AiMessage
 import com.chatbot.ai.AiProvider
 import com.chatbot.ai.openai.OpenAiProperties
-import com.chatbot.analytics.ActivityLogRepository
 import com.chatbot.chat.dto.ChatCreateRequest
 import com.chatbot.chat.dto.ChatItem
 import com.chatbot.chat.dto.ChatResponse
 import com.chatbot.chat.dto.ThreadWithChatsResponse
-import com.chatbot.domain.analytics.ActivityAction
-import com.chatbot.domain.analytics.ActivityLog
-import com.chatbot.domain.chat.Chat
-import com.chatbot.domain.chat.ChatThread
 import com.chatbot.domain.user.Role
 import com.chatbot.global.common.PageResponse
 import com.chatbot.global.exception.CustomException
 import com.chatbot.global.exception.ErrorCode
 import com.chatbot.global.security.CustomUserDetails
-import com.chatbot.user.UserRepository
+import com.fasterxml.jackson.databind.ObjectMapper
 import org.springframework.data.domain.PageRequest
 import org.springframework.data.domain.Sort
 import org.springframework.stereotype.Service
-import org.springframework.transaction.PlatformTransactionManager
 import org.springframework.transaction.annotation.Transactional
-import org.springframework.transaction.support.TransactionTemplate
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter
-import java.time.OffsetDateTime
+import reactor.core.scheduler.Schedulers
 import java.util.UUID
-import java.util.concurrent.CompletableFuture
 
+/**
+ * 퍼사드 서비스.
+ * 비즈니스 흐름을 조율하되, 트랜잭션 범위 안에 외부 I/O를 포함하지 않는다.
+ * - tx1: chatTransactionService.openThread (짧음)
+ * - 외부 I/O: aiProvider.complete / aiProvider.stream (트랜잭션 밖)
+ * - tx2: chatTransactionService.persistChat (짧음)
+ */
 @Service
 class ChatService(
+    private val chatTransactionService: ChatTransactionService,
     private val threadRepository: ThreadRepository,
     private val chatRepository: ChatRepository,
-    private val userRepository: UserRepository,
-    private val activityLogRepository: ActivityLogRepository,
     private val aiProvider: AiProvider,
     private val openAiProperties: OpenAiProperties,
-    transactionManager: PlatformTransactionManager,
+    private val objectMapper: ObjectMapper,
 ) {
-
-    private val transactionTemplate = TransactionTemplate(transactionManager)
 
     companion object {
         private val SUPPORTED_MODELS = setOf("gpt-5-nano", "gpt-5.2", "gpt-4o-mini", "gpt-4.1")
@@ -59,131 +54,83 @@ class ChatService(
     }
 
     /**
-     * 30분 규칙: 마지막 스레드의 lastChatAt이 30분 이내면 재사용, 아니면 신규 생성.
-     * cutoff = now - 30분; lastChatAt.isAfter(cutoff) → 재사용 (정확히 30분 전 = isAfter false → 신규)
-     */
-    fun getOrCreateThread(userId: UUID): ChatThread {
-        val cutoff = OffsetDateTime.now().minusMinutes(30)
-        return threadRepository.findTopByUserIdOrderByLastChatAtDesc(userId)
-            ?.takeIf { it.lastChatAt.isAfter(cutoff) }
-            ?: run {
-                val user = userRepository.findById(userId)
-                    .orElseThrow { CustomException(ErrorCode.NOT_FOUND) }
-                threadRepository.save(ChatThread(user = user))
-            }
-    }
-
-    /**
-     * 이전 대화 히스토리를 user/assistant 쌍으로 구성하고 마지막에 현재 질문을 추가한다.
-     */
-    fun buildMessages(history: List<Chat>, currentQuestion: String): List<AiMessage> {
-        val messages = mutableListOf<AiMessage>()
-        history.forEach { chat ->
-            messages += AiMessage("user", chat.question)
-            messages += AiMessage("assistant", chat.answer)
-        }
-        messages += AiMessage("user", currentQuestion)
-        return messages
-    }
-
-    /**
      * 비스트리밍 대화 생성.
-     * 트랜잭션 내에서: 스레드 결정 → 히스토리 로드 → AI 호출 → Chat 저장 → ActivityLog 저장.
+     * tx1 → AI 호출(트랜잭션 밖) → tx2 순서로 실행.
+     * @Transactional 없음: DB 커넥션을 AI 대기 동안 점유하지 않는다.
      */
-    @Transactional
     fun createChat(userId: UUID, req: ChatCreateRequest): ChatResponse {
         val model = resolveModel(req.model)
-        val thread = getOrCreateThread(userId)
-        val history = chatRepository.findByThreadIdOrderByCreatedAtAsc(thread.id!!)
-        val messages = buildMessages(history, req.question)
-        val answer = aiProvider.complete(messages, model)
-
-        val user = thread.user
-        val chat = chatRepository.save(
-            Chat(thread = thread, user = user, question = req.question, answer = answer, model = model),
+        val ctx = chatTransactionService.openThread(userId, req.question)       // tx1 (짧음)
+        val answer = aiProvider.complete(ctx.messages, model)                   // 트랜잭션 밖
+        val result = chatTransactionService.persistChat(                        // tx2 (짧음)
+            ctx.threadId, userId, req.question, answer, model,
         )
-        thread.lastChatAt = OffsetDateTime.now()
-        activityLogRepository.save(ActivityLog(user = user, action = ActivityAction.CHAT_CREATE))
-
         return ChatResponse(
-            id = chat.id!!,
-            threadId = thread.id!!,
-            question = chat.question,
-            answer = chat.answer,
-            model = chat.model,
-            createdAt = chat.createdAt,
+            id = result.chatId,
+            threadId = result.threadId,
+            question = req.question,
+            answer = answer,
+            model = model,
+            createdAt = result.createdAt,
         )
     }
 
     /**
      * SSE 스트리밍 대화 생성.
-     * - 스레드/히스토리/메시지 준비 후 CompletableFuture로 비동기 실행
-     * - 각 토큰을 emitter로 전송하며 누적
-     * - 완료 시 별도 트랜잭션(TransactionTemplate)으로 Chat/ActivityLog 저장
-     * - 에러 시 emitter.completeWithError
+     * - tx1으로 스레드/메시지 준비 후 Reactor subscribe (논블로킹)
+     * - publishOn(boundedElastic): 이벤트루프 보호 + 블로킹 emitter.send 격리
+     * - 완료 시 tx2로 Chat/ActivityLog 저장 후 SSE done 이벤트 전송
+     * - timeout/error/completion 시 disposable 정리
      */
     fun createChatStreaming(userId: UUID, req: ChatCreateRequest, emitter: SseEmitter) {
         val model = resolveModel(req.model)
-        val thread = getOrCreateThread(userId)
-        val threadId = thread.id!!
-        val history = chatRepository.findByThreadIdOrderByCreatedAtAsc(threadId)
-        val messages = buildMessages(history, req.question)
-        val accumulator = StringBuilder()
-
-        CompletableFuture.runAsync {
-            try {
-                aiProvider.stream(messages, model)
-                    .doOnNext { token ->
-                        accumulator.append(token)
-                        emitter.send(SseEmitter.event().data("""{"token":"$token"}"""))
-                    }
-                    .doOnComplete {
-                        try {
-                            transactionTemplate.executeWithoutResult {
-                                val user = userRepository.findById(userId)
-                                    .orElseThrow { CustomException(ErrorCode.NOT_FOUND) }
-                                val managedThread = threadRepository.findById(threadId)
-                                    .orElseThrow { CustomException(ErrorCode.NOT_FOUND) }
-                                val chat = chatRepository.save(
-                                    Chat(
-                                        thread = managedThread,
-                                        user = user,
-                                        question = req.question,
-                                        answer = accumulator.toString(),
-                                        model = model,
+        val ctx = chatTransactionService.openThread(userId, req.question)       // tx1
+        val sb = StringBuilder()
+        val disposable = aiProvider.stream(ctx.messages, model)
+            .publishOn(Schedulers.boundedElastic())
+            .subscribe(
+                { token ->
+                    sb.append(token)
+                    emitter.send(
+                        SseEmitter.event().data(
+                            objectMapper.writeValueAsString(mapOf("token" to token)),
+                        ),
+                    )
+                },
+                { e -> emitter.completeWithError(e) },
+                {
+                    try {
+                        val r = chatTransactionService.persistChat(             // tx2
+                            ctx.threadId, userId, req.question, sb.toString(), model,
+                        )
+                        emitter.send(
+                            SseEmitter.event().data(
+                                objectMapper.writeValueAsString(
+                                    mapOf(
+                                        "done" to true,
+                                        "chatId" to r.chatId.toString(),
+                                        "threadId" to r.threadId.toString(),
                                     ),
-                                )
-                                managedThread.lastChatAt = OffsetDateTime.now()
-                                activityLogRepository.save(
-                                    ActivityLog(user = user, action = ActivityAction.CHAT_CREATE),
-                                )
-                                emitter.send(
-                                    SseEmitter.event().data(
-                                        """{"done":true,"chatId":"${chat.id}","threadId":"${managedThread.id}"}""",
-                                    ),
-                                )
-                                emitter.complete()
-                            }
-                        } catch (e: Exception) {
-                            emitter.completeWithError(e)
-                        }
-                    }
-                    .doOnError { e ->
+                                ),
+                            ),
+                        )
+                        emitter.complete()
+                    } catch (e: Exception) {
                         emitter.completeWithError(e)
                     }
-                    .subscribe()
-            } catch (e: Exception) {
-                emitter.completeWithError(e)
-            }
-        }
+                },
+            )
+        emitter.onTimeout { disposable.dispose(); emitter.complete() }
+        emitter.onError { disposable.dispose() }
+        emitter.onCompletion { disposable.dispose() }
     }
 
     /**
      * 대화 목록 조회 (스레드 그룹화, N+1 방지).
      * - ADMIN: 전체 스레드 조회
      * - MEMBER: 본인 스레드만
-     * - 스레드에 속한 chats를 IN 쿼리로 일괄 조회 후 그룹화
      */
+    @Transactional(readOnly = true)
     fun getChats(
         userDetails: CustomUserDetails,
         sort: String,

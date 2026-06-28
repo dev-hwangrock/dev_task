@@ -3,6 +3,13 @@ spring:
     url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:chatbot_test}
     username: ${DB_USER:chatbot}
     password: ${DB_PASSWORD:chatbot}
+    hikari:
+      maximum-pool-size: 5
+      minimum-idle: 1
+      connection-timeout: 10000
+      max-lifetime: 1800000
+      idle-timeout: 600000
+      pool-name: chatbot-hikari
   jpa:
     hibernate:
       ddl-auto: validate

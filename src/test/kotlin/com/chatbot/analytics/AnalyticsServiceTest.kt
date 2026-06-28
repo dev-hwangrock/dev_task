@@ -9,10 +9,8 @@ import com.chatbot.domain.user.Role
 import com.chatbot.domain.user.User
 import com.chatbot.global.common.CsvUtil
 import io.mockk.every
-import io.mockk.just
 import io.mockk.mockk
 import io.mockk.mockkObject
-import io.mockk.Runs
 import io.mockk.slot
 import io.mockk.unmockkObject
 import io.mockk.verify
@@ -163,28 +161,31 @@ class AnalyticsServiceTest {
         )
         val response = mockk<HttpServletResponse>(relaxed = true)
 
-        every { chatRepository.findByCreatedAtBetween(any(), any()) } returns listOf(chat)
+        every { chatRepository.streamWithUserByCreatedAtBetween(any(), any()) } returns listOf(chat).stream()
 
         mockkObject(CsvUtil)
-        val rowsSlot = slot<List<List<String>>>()
-        val headersSlot = slot<List<String>>()
-        every { CsvUtil.writeCsvToResponse(capture(rowsSlot), capture(headersSlot), response) } just Runs
+        var capturedHeaders: List<String> = emptyList()
+        var capturedRows: List<List<String>> = emptyList()
+        every { CsvUtil.writeCsvStream(any(), any(), response) } answers {
+            capturedHeaders = firstArg()
+            capturedRows = secondArg<Sequence<List<String>>>().toList()
+        }
 
         // WHEN
         analyticsService.generateReport(response)
 
         // THEN
-        verify(exactly = 1) { chatRepository.findByCreatedAtBetween(any(), any()) }
-        verify(exactly = 1) { CsvUtil.writeCsvToResponse(any(), any(), response) }
+        verify(exactly = 1) { chatRepository.streamWithUserByCreatedAtBetween(any(), any()) }
+        verify(exactly = 1) { CsvUtil.writeCsvStream(any(), any(), response) }
 
         val expectedHeaders = listOf(
             "chat_id", "thread_id", "user_id", "user_email", "user_name",
             "question", "answer", "model", "created_at"
         )
-        assertEquals(expectedHeaders, headersSlot.captured)
+        assertEquals(expectedHeaders, capturedHeaders)
 
-        assertEquals(1, rowsSlot.captured.size)
-        val row = rowsSlot.captured[0]
+        assertEquals(1, capturedRows.size)
+        val row = capturedRows[0]
         assertEquals(chatId.toString(), row[0])
         assertEquals(thread.id.toString(), row[1])
         assertEquals(user.id.toString(), row[2])
