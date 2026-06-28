@@ -1,0 +1,34 @@
+# Environment
+.env
+
+# 과제 원본 문서 / 내부 설계 노트 (회사 식별 정보 - 공개 제외)
+task.pdf
+.task/
+
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# Logs
+*.log
+logs/
+
+# Spring Boot
+HELP.md
+target/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Kotlin
+*.class
+*.kotlin_module
